@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"strings"
 	"time"
 
 	"github.com/google/gopacket"
@@ -16,6 +17,59 @@ type Capture struct {
 
 type Packet struct {
 	metadata string
+}
+
+func detectProtocol(srcPort, dstPort uint16) string {
+	ports := map[uint16]string{
+		80:   "HTTP",
+		443:  "HTTPS",
+		53:   "DNS",
+		22:   "SSH",
+		21:   "FTP",
+		25:   "SMTP",
+		110:  "POP3",
+		143:  "IMAP",
+		3306: "MySQL",
+		5432: "PostgreSQL",
+		6379: "Redis",
+		8080: "HTTP-ALT",
+	}
+
+	if proto, ok := ports[dstPort]; ok {
+		return proto
+	}
+	if proto, ok := ports[srcPort]; ok {
+		return proto
+	}
+	return ""
+}
+
+func inspectPayload(payload []byte) string {
+	if len(payload) < 4 {
+		return ""
+	}
+
+	s := string(payload[:min(len(payload), 8)])
+
+	switch {
+	case strings.HasPrefix(s, "GET "),
+		strings.HasPrefix(s, "POST "),
+		strings.HasPrefix(s, "HTTP/"):
+		return "HTTP"
+	case strings.HasPrefix(s, "SSH-"):
+		return "SSH"
+	}
+
+	// DNS — check UDP port 53 payload structure
+	// first two bytes are transaction ID, safer to combine with port check
+	return ""
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // detailedPacket is a richer view of a captured packet than PacketSummary.
@@ -33,11 +87,14 @@ type detailedPacket struct {
 	EthernetType string
 
 	// network layer (IPv4 or IPv6)
-	NetworkType string // "IPv4", "IPv6", or ""
-	SrcIP       net.IP
-	DstIP       net.IP
-	TTL         uint8 // hop limit on IPv6
-	Protocol    string
+	NetworkType       string // "IPv4", "IPv6", or ""
+	SrcIP             net.IP
+	DstIP             net.IP
+	TTL               uint8 // hop limit on IPv6
+	TransportProtocol string
+
+	//Application layer
+	ApplicationProtocol string
 
 	// transport layer (TCP or UDP)
 	TransportType string // "TCP", "UDP", or ""
@@ -86,7 +143,7 @@ func toDetailedPacket(packet gopacket.Packet) *detailedPacket {
 		d.SrcIP = ip4.SrcIP
 		d.DstIP = ip4.DstIP
 		d.TTL = ip4.TTL
-		d.Protocol = ip4.Protocol.String()
+		d.TransportProtocol = ip4.Protocol.String()
 	}
 
 	if ip6Layer := packet.Layer(layers.LayerTypeIPv6); ip6Layer != nil {
@@ -95,7 +152,7 @@ func toDetailedPacket(packet gopacket.Packet) *detailedPacket {
 		d.SrcIP = ip6.SrcIP
 		d.DstIP = ip6.DstIP
 		d.TTL = ip6.HopLimit
-		d.Protocol = ip6.NextHeader.String()
+		d.TransportProtocol = ip6.NextHeader.String()
 	}
 
 	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
@@ -113,6 +170,10 @@ func toDetailedPacket(packet gopacket.Packet) *detailedPacket {
 		d.URG = tcp.URG
 		d.Window = tcp.Window
 		d.Payload = tcp.Payload
+		d.ApplicationProtocol = inspectPayload(tcp.Payload)
+		if d.ApplicationProtocol == "" {
+			d.ApplicationProtocol = detectProtocol(d.SrcPort, d.DstPort)
+		}
 	}
 
 	if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
@@ -137,10 +198,13 @@ type PacketSummary struct {
 	SrcIP net.IP
 	DstIP net.IP
 
+	//application
+	ApplicationProtocol string
+
 	// transport
-	Protocol string
-	SrcPort  uint16
-	DstPort  uint16
+	TransportProtocol string
+	SrcPort           uint16
+	DstPort           uint16
 
 	// payload
 	Payload []byte
@@ -151,7 +215,7 @@ type PacketSummary struct {
 
 // InterpretPacketInterface pulls the fields the TUI needs out of a raw
 // gopacket.Packet and returns a PacketSummary.
-func InterpretPacketInterface(packet gopacket.Packet) *PacketSummary {
+func toSummaryPacket(packet gopacket.Packet) *PacketSummary {
 	info := &PacketSummary{
 		Timestamp: packet.Metadata().Timestamp,
 		Length:    packet.Metadata().Length,
@@ -162,7 +226,7 @@ func InterpretPacketInterface(packet gopacket.Packet) *PacketSummary {
 		ip4, _ := ip4Layer.(*layers.IPv4)
 		info.SrcIP = ip4.SrcIP
 		info.DstIP = ip4.DstIP
-		info.Protocol = ip4.Protocol.String()
+		info.TransportProtocol = ip4.Protocol.String()
 	}
 
 	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
@@ -170,6 +234,12 @@ func InterpretPacketInterface(packet gopacket.Packet) *PacketSummary {
 		info.SrcPort = uint16(tcp.SrcPort)
 		info.DstPort = uint16(tcp.DstPort)
 		info.Payload = tcp.Payload
+
+		// try to identify what's running ON TOP of TCP
+		info.ApplicationProtocol = inspectPayload(tcp.Payload)
+		if info.ApplicationProtocol == "" {
+			info.ApplicationProtocol = detectProtocol(info.SrcPort, info.DstPort)
+		}
 	}
 
 	return info
@@ -192,7 +262,10 @@ func (c *Capture) Start() {
 }
 
 func (c *Capture) Stop() {
-	c.handle.Close()
+	// safe to call even if Start was never called (handle stays nil).
+	if c.handle != nil {
+		c.handle.Close()
+	}
 }
 
 // <- means that im giving you a channel that you can only receive from not write

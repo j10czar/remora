@@ -9,10 +9,11 @@ import (
 
 func main() {
 	cap := NewCapture("en0")
-	cap.Start()
 	defer cap.Stop()
 
-	p := tea.NewProgram(newModel(cap.Output()), tea.WithAltScreen())
+	// We don't start the capture here anymore. The TUI calls cap.Start()
+	// the first time the user hits space.
+	p := tea.NewProgram(newModel(cap), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
