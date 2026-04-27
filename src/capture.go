@@ -87,7 +87,9 @@ func inspectPayload(payload []byte) string {
 
 // detailedPacket is a richer view of a captured packet than PacketSummary.
 // PacketSummary is the trimmed-down version used by the TUI;
-// detailedPacket keeps fields from every layer for deeper inspection later.
+// detailedPacket keeps every field needed to reconstruct and retransmit a
+// modified copy of the packet — all layer values are stored as their native
+// gopacket types rather than display strings.
 type detailedPacket struct {
 	// metadata
 	Timestamp     time.Time
@@ -97,16 +99,28 @@ type detailedPacket struct {
 	// ethernet (link layer)
 	SrcMAC       net.HardwareAddr
 	DstMAC       net.HardwareAddr
-	EthernetType string
+	EthernetType layers.EthernetType // e.g. layers.EthernetTypeIPv4
 
-	// network layer (IPv4 or IPv6)
-	NetworkType       string // "IPv4", "IPv6", or ""
-	SrcIP             net.IP
-	DstIP             net.IP
-	TTL               uint8 // hop limit on IPv6
-	TransportProtocol string
+	// network layer — only one of the two blocks below is populated
+	NetworkType string // "IPv4", "IPv6", or ""
+	SrcIP       net.IP
+	DstIP       net.IP
 
-	//Application layer
+	// IPv4-specific
+	IPv4ID        uint16
+	IPv4TOS       uint8
+	IPv4Flags     layers.IPv4Flag // DF, MF
+	IPv4FragOffset uint16
+	IPv4TTL       uint8
+	IPv4Protocol  layers.IPProtocol // TCP, UDP, ICMP …
+
+	// IPv6-specific
+	IPv6HopLimit     uint8
+	IPv6TrafficClass uint8
+	IPv6FlowLabel    uint32
+	IPv6NextHeader   layers.IPProtocol
+
+	// application layer
 	ApplicationProtocol string
 
 	// transport layer (TCP or UDP)
@@ -114,21 +128,22 @@ type detailedPacket struct {
 	SrcPort       uint16
 	DstPort       uint16
 
-	// TCP-specific (zero on UDP / non-TCP)
-	Seq    uint32
-	Ack    uint32
-	SYN    bool
-	ACK    bool
-	FIN    bool
-	RST    bool
-	PSH    bool
-	URG    bool
-	Window uint16
+	// TCP-specific (zero / nil on UDP / non-TCP)
+	Seq        uint32
+	Ack        uint32
+	SYN        bool
+	ACK        bool
+	FIN        bool
+	RST        bool
+	PSH        bool
+	URG        bool
+	Window     uint16
+	TCPOptions []layers.TCPOption // MSS, SACK, timestamps, window-scale …
 
 	// payload bytes from the transport layer
 	Payload []byte
 
-	// raw packet preserved for anything not extracted above
+	// raw packet preserved as a fast path for unmodified retransmit
 	Raw gopacket.Packet
 }
 
@@ -147,7 +162,7 @@ func toDetailedPacket(packet gopacket.Packet) *detailedPacket {
 		eth, _ := ethLayer.(*layers.Ethernet)
 		d.SrcMAC = eth.SrcMAC
 		d.DstMAC = eth.DstMAC
-		d.EthernetType = eth.EthernetType.String()
+		d.EthernetType = eth.EthernetType
 	}
 
 	if ip4Layer := packet.Layer(layers.LayerTypeIPv4); ip4Layer != nil {
@@ -155,8 +170,12 @@ func toDetailedPacket(packet gopacket.Packet) *detailedPacket {
 		d.NetworkType = "IPv4"
 		d.SrcIP = ip4.SrcIP
 		d.DstIP = ip4.DstIP
-		d.TTL = ip4.TTL
-		d.TransportProtocol = ip4.Protocol.String()
+		d.IPv4ID = ip4.Id
+		d.IPv4TOS = ip4.TOS
+		d.IPv4Flags = ip4.Flags
+		d.IPv4FragOffset = ip4.FragOffset
+		d.IPv4TTL = ip4.TTL
+		d.IPv4Protocol = ip4.Protocol
 	}
 
 	if ip6Layer := packet.Layer(layers.LayerTypeIPv6); ip6Layer != nil {
@@ -164,8 +183,10 @@ func toDetailedPacket(packet gopacket.Packet) *detailedPacket {
 		d.NetworkType = "IPv6"
 		d.SrcIP = ip6.SrcIP
 		d.DstIP = ip6.DstIP
-		d.TTL = ip6.HopLimit
-		d.TransportProtocol = ip6.NextHeader.String()
+		d.IPv6HopLimit = ip6.HopLimit
+		d.IPv6TrafficClass = ip6.TrafficClass
+		d.IPv6FlowLabel = ip6.FlowLabel
+		d.IPv6NextHeader = ip6.NextHeader
 	}
 
 	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
@@ -182,6 +203,7 @@ func toDetailedPacket(packet gopacket.Packet) *detailedPacket {
 		d.PSH = tcp.PSH
 		d.URG = tcp.URG
 		d.Window = tcp.Window
+		d.TCPOptions = tcp.Options
 		d.Payload = tcp.Payload
 		d.ApplicationProtocol = inspectPayload(tcp.Payload)
 		if d.ApplicationProtocol == "" {
