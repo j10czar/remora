@@ -19,22 +19,42 @@ type Packet struct {
 	metadata string
 }
 
-func detectProtocol(srcPort, dstPort uint16) string {
+func detectTCPProtocol(srcPort, dstPort uint16) string {
 	ports := map[uint16]string{
-		80:   "HTTP",
-		443:  "HTTPS",
-		53:   "DNS",
-		22:   "SSH",
 		21:   "FTP",
+		22:   "SSH",
 		25:   "SMTP",
+		80:   "HTTP",
 		110:  "POP3",
 		143:  "IMAP",
+		443:  "HTTPS",
 		3306: "MySQL",
 		5432: "PostgreSQL",
 		6379: "Redis",
 		8080: "HTTP-ALT",
 	}
+	if proto, ok := ports[dstPort]; ok {
+		return proto
+	}
+	if proto, ok := ports[srcPort]; ok {
+		return proto
+	}
+	return ""
+}
 
+func detectUDPProtocol(srcPort, dstPort uint16) string {
+	ports := map[uint16]string{
+		53:   "DNS",
+		67:   "DHCP",
+		68:   "DHCP",
+		69:   "TFTP",
+		123:  "NTP",
+		161:  "SNMP",
+		162:  "SNMP",
+		514:  "Syslog",
+		4789: "VXLAN",
+		5353: "mDNS",
+	}
 	if proto, ok := ports[dstPort]; ok {
 		return proto
 	}
@@ -63,13 +83,6 @@ func inspectPayload(payload []byte) string {
 	// DNS — check UDP port 53 payload structure
 	// first two bytes are transaction ID, safer to combine with port check
 	return ""
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // detailedPacket is a richer view of a captured packet than PacketSummary.
@@ -172,7 +185,7 @@ func toDetailedPacket(packet gopacket.Packet) *detailedPacket {
 		d.Payload = tcp.Payload
 		d.ApplicationProtocol = inspectPayload(tcp.Payload)
 		if d.ApplicationProtocol == "" {
-			d.ApplicationProtocol = detectProtocol(d.SrcPort, d.DstPort)
+			d.ApplicationProtocol = detectTCPProtocol(d.SrcPort, d.DstPort)
 		}
 	}
 
@@ -182,6 +195,7 @@ func toDetailedPacket(packet gopacket.Packet) *detailedPacket {
 		d.SrcPort = uint16(udp.SrcPort)
 		d.DstPort = uint16(udp.DstPort)
 		d.Payload = udp.Payload
+		d.ApplicationProtocol = detectUDPProtocol(d.SrcPort, d.DstPort)
 	}
 
 	return d
@@ -234,12 +248,18 @@ func toSummaryPacket(packet gopacket.Packet) *PacketSummary {
 		info.SrcPort = uint16(tcp.SrcPort)
 		info.DstPort = uint16(tcp.DstPort)
 		info.Payload = tcp.Payload
-
-		// try to identify what's running ON TOP of TCP
 		info.ApplicationProtocol = inspectPayload(tcp.Payload)
 		if info.ApplicationProtocol == "" {
-			info.ApplicationProtocol = detectProtocol(info.SrcPort, info.DstPort)
+			info.ApplicationProtocol = detectTCPProtocol(info.SrcPort, info.DstPort)
 		}
+	}
+
+	if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+		udp, _ := udpLayer.(*layers.UDP)
+		info.SrcPort = uint16(udp.SrcPort)
+		info.DstPort = uint16(udp.DstPort)
+		info.Payload = udp.Payload
+		info.ApplicationProtocol = detectUDPProtocol(info.SrcPort, info.DstPort)
 	}
 
 	return info

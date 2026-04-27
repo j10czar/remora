@@ -57,6 +57,10 @@ type packetMsg *PacketSummary
 // newer flash has happened in the meantime, an older clearFlashMsg is ignored.
 type clearFlashMsg struct{ id int }
 
+// clearMsgBoxMsg is fired 4 seconds after showMessage to hide the message box.
+// The id guards against a stale tick clearing a newer message.
+type clearMsgBoxMsg struct{ id int }
+
 // -----------------------------------------------------------------------------
 // HOTKEYS
 // -----------------------------------------------------------------------------
@@ -111,6 +115,8 @@ type model struct {
 	count    int                    // total packets seen — shown in footer
 	flashIdx int                    // index of the hotkey currently flashing, -1 if none
 	flashID  int                    // generation counter so stale clear-ticks are ignored
+	msgBox   string                 // text currently shown in the message box, "" = hidden
+	msgBoxID int                    // generation counter so stale clear-ticks don't hide newer messages
 }
 
 // newModel builds the initial model: an empty table with our column layout,
@@ -185,6 +191,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(flashCmd, actionCmd)
 			}
 
+			if keyStr == "c" {
+				actionCmd := m.clearPackets()
+				return m, tea.Batch(flashCmd, actionCmd)
+			}
+
 			// every other hotkey just flashes; behavior TBD.
 			return m, flashCmd
 		}
@@ -193,6 +204,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// only honor the clear if no newer flash has happened since.
 		if msg.id == m.flashID {
 			m.flashIdx = -1
+		}
+		return m, nil
+
+	case clearMsgBoxMsg:
+		if msg.id == m.msgBoxID {
+			m.msgBox = ""
 		}
 		return m, nil
 
@@ -227,12 +244,12 @@ func (m model) View() string {
 		"© 2026 Jason Tenczar  ·  packets: " + strconv.Itoa(m.count),
 	)
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		m.tableArea(),
-		m.hotkeyBar(),
-		footer,
-	)
+	parts := []string{header, m.tableArea(), m.hotkeyBar()}
+	if m.msgBox != "" {
+		parts = append(parts, msgBoxStyle.Render("  "+m.msgBox))
+	}
+	parts = append(parts, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 // statusText is the right-hand half of the subtitle: tells the user what
@@ -369,6 +386,27 @@ func (m *model) toggleCapture() tea.Cmd {
 	return nil
 }
 
+func (m *model) clearPackets() tea.Cmd {
+	if m.state == stateRunning {
+		return m.showMessage("pause capture before clearing  (space → pause, then c)")
+	}
+	m.table.SetRows([]table.Row{})
+	m.count = 0
+	return nil
+}
+
+// showMessage displays text in the message box and schedules its removal after
+// 4 seconds. Rapid calls are safe — the generation counter ensures only the
+// most recent tick actually clears the box.
+func (m *model) showMessage(text string) tea.Cmd {
+	m.msgBox = text
+	m.msgBoxID++
+	id := m.msgBoxID
+	return tea.Tick(4*time.Second, func(time.Time) tea.Msg {
+		return clearMsgBoxMsg{id: id}
+	})
+}
+
 // appendRow adds a row to the table, caps the buffer at 1000 rows so memory
 // doesn't grow forever, and auto-scrolls to the newest row.
 func (m *model) appendRow(row table.Row) {
@@ -426,6 +464,15 @@ var (
 				Bold(true).
 				MarginRight(1).
 				MarginTop(1)
+
+	// message box: amber border, shown for 4 seconds then hidden.
+	msgBoxStyle = lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#F4A827")).
+			Foreground(lipgloss.Color("#F4A827")).
+			Bold(true).
+			MarginTop(1).
+			Padding(0, 1)
 )
 
 // tableStyles tweaks the bubbles/table defaults so headers and the selected
