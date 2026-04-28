@@ -121,6 +121,12 @@ type app struct {
 	captureCursorID    uint64
 	captureCursorValid bool
 	captureFollow      bool
+
+	// filter applied to the capture table. The zero value is the inactive
+	// "match everything" filter — no nil-checks needed at the call sites.
+	// Lives on the app (not the capture page) so future pages can read it
+	// without coupling to capture-page internals.
+	filter PacketFilter
 }
 
 // newApp constructs the root model with a capture handle and a ring buffer
@@ -167,6 +173,18 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		keyStr := normalizeKey(msg.String())
+		// When a page is in modal mode (a popup is collecting input), the
+		// global hotkeys (q, space) would otherwise eat keystrokes the user
+		// is trying to type into a textinput. Forward everything but
+		// ctrl+c — keeping that as an unconditional escape hatch.
+		if mp, ok := a.page.(interface{ IsModal() bool }); ok && mp.IsModal() {
+			if keyStr == "ctrl+c" {
+				return a, tea.Quit
+			}
+			var cmd tea.Cmd
+			a.page, cmd = a.page.Update(msg)
+			return a, cmd
+		}
 		switch keyStr {
 		case "q", "ctrl+c":
 			return a, tea.Quit

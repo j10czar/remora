@@ -27,9 +27,18 @@ import (
 // =============================================================================
 
 type capturePage struct {
-	app     *app
-	table   table.Model
-	firstID uint64 // global ID of the topmost row, refreshed on every render
+	app   *app
+	table table.Model
+
+	// rowIDs is the global packet ID for each visible row. Without a filter
+	// it's a contiguous range; with a filter active the mapping is
+	// non-linear, so we cache it on every refresh and consult it in
+	// selectedID/saveCursor.
+	rowIDs []uint64
+
+	// filter popup — modal sub-component. While popup.IsActive() the page
+	// forwards every key into it instead of running its own hotkeys.
+	popup *filterPopup
 }
 
 func newCapturePage(a *app) *capturePage {
@@ -49,14 +58,39 @@ func newCapturePage(a *app) *capturePage {
 	)
 	t.SetStyles(tableStyles())
 
-	return &capturePage{app: a, table: t}
+	return &capturePage{app: a, table: t, popup: newFilterPopup()}
 }
+
+// IsModal lets the root model know to bypass global hotkeys (q, space) while
+// the filter popup is collecting input — otherwise space would toggle
+// capture instead of inserting into the textinput. The interface is
+// duck-typed in app.Update; only pages with modal sub-components implement it.
+func (p *capturePage) IsModal() bool { return p.popup.IsActive() }
 
 // Init has no async work — the packet pump is owned by the root model and
 // runs across page transitions, not per-page.
 func (p *capturePage) Init() tea.Cmd { return nil }
 
 func (p *capturePage) Update(msg tea.Msg) (Page, tea.Cmd) {
+	// While the filter popup is open, every key belongs to the popup.
+	if p.popup.IsActive() {
+		if _, ok := msg.(tea.KeyMsg); ok {
+			submit, cancel, cmd := p.popup.Update(msg)
+			switch {
+			case submit:
+				p.app.filter = p.popup.Value()
+				p.popup.Close()
+				// re-arm follow so the cursor jumps to the newest matching
+				// packet rather than staying on a stale ID that the filter
+				// may have just hidden.
+				p.app.captureFollow = true
+			case cancel:
+				p.popup.Close()
+			}
+			return p, cmd
+		}
+	}
+
 	if msg, ok := msg.(tea.KeyMsg); ok {
 		switch normalizeKey(msg.String()) {
 		case "c":
@@ -67,6 +101,9 @@ func (p *capturePage) Update(msg tea.Msg) (Page, tea.Cmd) {
 			return p, tea.Batch(p.app.flashHotkey("e"), p.openEdit())
 		case "r":
 			return p, tea.Batch(p.app.flashHotkey("r"), p.openRetransmit())
+		case "f":
+			p.popup.Open(p.app.filter)
+			return p, p.app.flashHotkey("f")
 		case "l":
 			// jump to latest + re-enable follow. refreshTable will pin
 			// the cursor to the last row on the next render.
@@ -91,11 +128,17 @@ func (p *capturePage) Update(msg tea.Msg) (Page, tea.Cmd) {
 
 // saveCursor persists the cursor's global ID onto the app so it survives
 // page swaps (capture → inspect → back rebuilds the page from scratch).
+// With a filter active, row indices are non-contiguous, so we read the ID
+// from the rowIDs cache rather than firstID + cursor.
 func (p *capturePage) saveCursor() {
-	if len(p.table.Rows()) == 0 {
+	if len(p.rowIDs) == 0 {
 		return
 	}
-	p.app.captureCursorID = p.firstID + uint64(p.table.Cursor())
+	idx := p.table.Cursor()
+	if idx < 0 || idx >= len(p.rowIDs) {
+		return
+	}
+	p.app.captureCursorID = p.rowIDs[idx]
 	p.app.captureCursorValid = true
 }
 
@@ -112,17 +155,32 @@ func (p *capturePage) View() string {
 
 	bar := renderHotkeyBar(p.hotkeys(), p.app.flashKey)
 
+	// `buffered` is the visible row count; with a filter active that's a
+	// subset of the actual ring buffer occupancy, so we surface both numbers
+	// and tag the line so the user doesn't read it as the whole picture.
+	bufLine := fmt.Sprintf("buffered: %d", len(p.table.Rows()))
+	if p.app.filter.Active() {
+		bufLine = fmt.Sprintf("buffered: %d of %d  (showing filtered packets only)",
+			len(p.table.Rows()), p.app.buf.Len())
+	}
 	footer := footerStyle.Render(
-		fmt.Sprintf("© 2026 Jason Tenczar  ·  packets: %d  ·  buffered: %d",
-			p.app.buf.Total(), len(p.table.Rows())),
+		fmt.Sprintf("© 2026 Jason Tenczar  ·  packets: %d  ·  %s",
+			p.app.buf.Total(), bufLine),
 	)
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		p.tableArea(),
-		bar,
-		footer,
-	)
+	// Compose the variable middle: table, then the active-filter banner if
+	// any, then the popup if open. Empty strings are dropped so JoinVertical
+	// doesn't leave blank lines behind.
+	middle := []string{p.tableArea()}
+	if banner := renderFilterBanner(p.app.filter); banner != "" {
+		middle = append(middle, banner)
+	}
+	if p.popup.IsActive() {
+		middle = append(middle, p.popup.View())
+	}
+	middle = append(middle, bar, footer)
+
+	return lipgloss.JoinVertical(lipgloss.Left, append([]string{header}, middle...)...)
 }
 
 // refreshTable pulls the latest snapshot from the ring buffer and rebuilds
@@ -139,11 +197,21 @@ func (p *capturePage) View() string {
 //     so the user lands near where they were rather than the live tail.
 func (p *capturePage) refreshTable() {
 	snap, firstID := p.app.buf.Snapshot()
-	p.firstID = firstID
 
-	rows := make([]table.Row, len(snap))
-	for i, d := range snap {
+	// Apply the filter (no-op when inactive). The returned indices give us
+	// the position of each match within `snap`, which we add to firstID to
+	// get the stable global ID — that mapping is what makes inspect/edit
+	// continue to work even when the table is showing a filtered subset.
+	matched, indices := p.app.filter.Apply(snap)
+	rows := make([]table.Row, len(matched))
+	p.rowIDs = make([]uint64, len(matched))
+	for i, d := range matched {
 		rows[i] = buildRow(d)
+		if p.app.filter.Active() {
+			p.rowIDs[i] = firstID + uint64(indices[i])
+		} else {
+			p.rowIDs[i] = firstID + uint64(i)
+		}
 	}
 	p.table.SetRows(rows)
 
@@ -156,11 +224,9 @@ func (p *capturePage) refreshTable() {
 	case p.app.captureFollow:
 		target = len(rows) - 1
 	case p.app.captureCursorValid:
-		savedID := p.app.captureCursorID
-		if savedID >= p.firstID && savedID < p.firstID+uint64(len(rows)) {
-			target = int(savedID - p.firstID)
-		} else {
-			target = 0 // saved packet evicted; show oldest still in buffer
+		target = indexOfID(p.rowIDs, p.app.captureCursorID)
+		if target < 0 {
+			target = 0 // saved packet evicted or filtered out; show first visible
 		}
 	}
 
@@ -211,10 +277,23 @@ func (p *capturePage) tableArea() string {
 // Returns false when the table is empty so callers can show a "no packet
 // selected" notice instead of navigating with a bogus ID.
 func (p *capturePage) selectedID() (uint64, bool) {
-	if len(p.table.Rows()) == 0 {
+	idx := p.table.Cursor()
+	if idx < 0 || idx >= len(p.rowIDs) {
 		return 0, false
 	}
-	return p.firstID + uint64(p.table.Cursor()), true
+	return p.rowIDs[idx], true
+}
+
+// indexOfID is a small linear search over rowIDs. The list maxes out at the
+// ring buffer's capacity (default 1000), so this is fine to call on every
+// render without indexing it.
+func indexOfID(ids []uint64, target uint64) int {
+	for i, id := range ids {
+		if id == target {
+			return i
+		}
+	}
+	return -1
 }
 
 // -----------------------------------------------------------------------------
@@ -262,14 +341,21 @@ func (p *capturePage) openRetransmit() tea.Cmd {
 }
 
 // hotkeys is the bar this page renders. retransmit is greyed out until
-// edited packets exist; the others are always live.
+// edited packets exist; the others are always live. The `f` label flips
+// to "edit filter" when one is set so the user knows reopening will show
+// pre-filled values they can wipe to clear.
 func (p *capturePage) hotkeys() []hotkey {
+	filterLabel := "filter"
+	if p.app.filter.Active() {
+		filterLabel = "edit filter"
+	}
 	return []hotkey{
 		{Key: "space", Label: "start/pause"},
 		{Key: "c", Label: "clear"},
 		{Key: "i", Label: "inspect"},
 		{Key: "e", Label: "edit"},
 		{Key: "r", Label: "retransmit", Disabled: len(p.app.edited) == 0},
+		{Key: "f", Label: filterLabel},
 		{Key: "l", Label: "latest"},
 		{Key: "h", Label: "help"},
 	}

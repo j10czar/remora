@@ -102,6 +102,18 @@ func (r *PacketRingBuffer) Total() uint64 {
 	return r.total
 }
 
+// Len is the number of packets currently in the window — Total() until the
+// buffer fills, then capped at size after it wraps. Useful for showing "X of
+// Y in buffer" when a UI is rendering a filtered subset.
+func (r *PacketRingBuffer) Len() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.total < r.size {
+		return int(r.total)
+	}
+	return int(r.size)
+}
+
 // Reset empties the buffer and resets the global ID counter. The capture
 // page's "clear" hotkey calls this; ID #0 will start over from the next
 // Add() so the user gets a clean view.
