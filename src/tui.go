@@ -108,15 +108,29 @@ type app struct {
 	// from here so all flashes share one debounce counter.
 	flashKey string
 	flashID  int
+
+	// capture-page persistence. The capture page is reconstructed on every
+	// navigation back from inspect/edit, so its scroll state has to live
+	// here to survive page swaps.
+	//   captureCursorID    — global packet ID the cursor was on
+	//   captureCursorValid — false until the cursor has been on a real row
+	//   captureFollow      — when true, refreshTable pins the cursor to the
+	//                        newest packet so the live view scrolls along
+	//                        with arrivals; toggled off by manual scroll
+	//                        and back on by the "latest" hotkey.
+	captureCursorID    uint64
+	captureCursorValid bool
+	captureFollow      bool
 }
 
 // newApp constructs the root model with a capture handle and a ring buffer
 // sized per the user's CLI flag. The starting page is the capture page.
 func newApp(cap *Capture, bufSize int) *app {
 	a := &app{
-		cap:   cap,
-		buf:   NewPacketRingBuffer(bufSize),
-		state: stateIdle,
+		cap:           cap,
+		buf:           NewPacketRingBuffer(bufSize),
+		state:         stateIdle,
+		captureFollow: true,
 	}
 	a.page = newCapturePage(a)
 	a.pageID = pageCapture

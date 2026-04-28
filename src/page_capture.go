@@ -57,8 +57,7 @@ func newCapturePage(a *app) *capturePage {
 func (p *capturePage) Init() tea.Cmd { return nil }
 
 func (p *capturePage) Update(msg tea.Msg) (Page, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	if msg, ok := msg.(tea.KeyMsg); ok {
 		switch normalizeKey(msg.String()) {
 		case "c":
 			return p, tea.Batch(p.app.flashHotkey("c"), p.clear())
@@ -68,13 +67,36 @@ func (p *capturePage) Update(msg tea.Msg) (Page, tea.Cmd) {
 			return p, tea.Batch(p.app.flashHotkey("e"), p.openEdit())
 		case "r":
 			return p, tea.Batch(p.app.flashHotkey("r"), p.openRetransmit())
+		case "l":
+			// jump to latest + re-enable follow. refreshTable will pin
+			// the cursor to the last row on the next render.
+			p.app.captureFollow = true
+			return p, p.app.flashHotkey("l")
+		case "end", "G":
+			// table will move cursor to last; we also flip follow on so
+			// subsequent packets keep scrolling into view.
+			p.app.captureFollow = true
+		case "up", "k", "down", "j", "pgup", "pgdown", "home", "g":
+			// any manual scroll detaches us from the live tail.
+			p.app.captureFollow = false
 		}
 	}
 
 	// arrow keys / page up/down / etc. go to the table for cursor movement.
 	var cmd tea.Cmd
 	p.table, cmd = p.table.Update(msg)
+	p.saveCursor()
 	return p, cmd
+}
+
+// saveCursor persists the cursor's global ID onto the app so it survives
+// page swaps (capture → inspect → back rebuilds the page from scratch).
+func (p *capturePage) saveCursor() {
+	if len(p.table.Rows()) == 0 {
+		return
+	}
+	p.app.captureCursorID = p.firstID + uint64(p.table.Cursor())
+	p.app.captureCursorValid = true
 }
 
 func (p *capturePage) View() string {
@@ -106,6 +128,15 @@ func (p *capturePage) View() string {
 // refreshTable pulls the latest snapshot from the ring buffer and rebuilds
 // the table rows. firstID is captured here so selectedID() can translate
 // the cursor into a global ID without re-snapshotting.
+//
+// After repopulating the rows, the cursor is repositioned according to two
+// pieces of app-level state:
+//   - captureFollow=true → pin to the last row so the view tracks new
+//     arrivals (the default, and the fix for "view stuck at the top when
+//     capture starts").
+//   - captureFollow=false → restore to the saved global ID if it is still
+//     in the buffer; if it has been evicted, fall back to the oldest row
+//     so the user lands near where they were rather than the live tail.
 func (p *capturePage) refreshTable() {
 	snap, firstID := p.app.buf.Snapshot()
 	p.firstID = firstID
@@ -115,6 +146,41 @@ func (p *capturePage) refreshTable() {
 		rows[i] = buildRow(d)
 	}
 	p.table.SetRows(rows)
+
+	if len(rows) == 0 {
+		return
+	}
+
+	target := -1
+	switch {
+	case p.app.captureFollow:
+		target = len(rows) - 1
+	case p.app.captureCursorValid:
+		savedID := p.app.captureCursorID
+		if savedID >= p.firstID && savedID < p.firstID+uint64(len(rows)) {
+			target = int(savedID - p.firstID)
+		} else {
+			target = 0 // saved packet evicted; show oldest still in buffer
+		}
+	}
+
+	// SetCursor moves the index but leaves viewport.YOffset alone — the
+	// cursor lands below the visible window unless we go through MoveUp /
+	// MoveDown / GotoBottom, which sync the offset. GotoBottom keeps the
+	// selected row pinned to the bottom of the viewport in follow mode;
+	// MoveUp/MoveDown from the current cursor handle saved-position
+	// restores while keeping the cursor visible.
+	if target >= 0 {
+		switch {
+		case p.app.captureFollow:
+			p.table.GotoBottom()
+		case target > p.table.Cursor():
+			p.table.MoveDown(target - p.table.Cursor())
+		case target < p.table.Cursor():
+			p.table.MoveUp(p.table.Cursor() - target)
+		}
+	}
+	p.saveCursor()
 }
 
 func (p *capturePage) statusText() string {
@@ -163,6 +229,10 @@ func (p *capturePage) clear() tea.Cmd {
 		return showMsg("pause capture before clearing  (space → pause, then c)")
 	}
 	p.app.buf.Reset()
+	// nothing left to anchor on — drop saved cursor and re-arm follow so
+	// the next batch of packets scrolls into view automatically.
+	p.app.captureCursorValid = false
+	p.app.captureFollow = true
 	return nil
 }
 
@@ -200,6 +270,7 @@ func (p *capturePage) hotkeys() []hotkey {
 		{Key: "i", Label: "inspect"},
 		{Key: "e", Label: "edit"},
 		{Key: "r", Label: "retransmit", Disabled: len(p.app.edited) == 0},
+		{Key: "l", Label: "latest"},
 		{Key: "h", Label: "help"},
 	}
 }
