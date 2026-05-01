@@ -13,7 +13,7 @@ import (
 // =============================================================================
 // This file holds the *root model* — `app`. It is intentionally small:
 //   - it owns the shared state every page needs (capture handle, ring
-//     buffer, edited-packets list, capture state machine, message box)
+//     buffer, capture state machine, message box)
 //   - it routes incoming messages: a few global concerns are handled here
 //     (quit, capture toggle, packet arrivals, navigation, message box)
 //     and everything else is forwarded to the current page
@@ -89,12 +89,6 @@ type app struct {
 	buf   *PacketRingBuffer
 	pkts  <-chan gopacket.Packet
 	state captureState
-
-	// edited packets the user has saved out of the edit page. The
-	// retransmit page reads this; it's empty until the user actually
-	// edits + saves something. Hotkey bars grey out "retransmit" when
-	// this is empty.
-	edited []*detailedPacket
 
 	// routing
 	page   Page
@@ -262,9 +256,6 @@ func (a *app) swapPage(target pageID, arg any) {
 	case pageInspect:
 		id, _ := arg.(uint64)
 		a.page = newInspectPage(a, id)
-	case pageEdit:
-		id, _ := arg.(uint64)
-		a.page = newEditPage(a, id)
 	case pageRetransmit:
 		a.page = newRetransmitPage(a)
 	}

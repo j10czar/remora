@@ -46,7 +46,6 @@ type pageID int
 const (
 	pageCapture pageID = iota
 	pageInspect
-	pageEdit
 	pageRetransmit
 )
 
@@ -114,13 +113,12 @@ func renderHotkeyBar(keys []hotkey, flashedKey string) string {
 // -----------------------------------------------------------------------------
 // PAGE CHROME — title + accent border
 // -----------------------------------------------------------------------------
-// Each non-capture page (inspect / edit / retransmit) gets its own accent
-// color so the user can tell at a glance which screen they're on. These
-// helpers keep that consistent without copy-pasting style blocks.
+// Each non-capture page (inspect / retransmit) gets its own accent color
+// so the user can tell at a glance which screen they're on. These helpers
+// keep that consistent without copy-pasting style blocks.
 
 const (
 	accentInspect    = "#4FD1C5" // teal
-	accentEdit       = "#F687B3" // pink
 	accentRetransmit = "#F6AD55" // orange
 )
 
